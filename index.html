@@ -555,8 +555,30 @@
       </div>
 
       <div class="field">
-        <label class="field-label">Intended delivery address</label>
-        <input type="text" id="intended-address" placeholder="e.g. 123 Main St, Apt 4B, New York, NY 10001" />
+        <label class="field-label">Intended street address</label>
+        <input type="text" id="intended-street" placeholder="123 Main St" />
+      </div>
+
+      <div class="two-col">
+        <div class="field">
+          <label class="field-label">Unit / Apt <span style="font-weight:400;color:var(--text-muted);">(optional)</span></label>
+          <input type="text" id="intended-unit" placeholder="Apt 4B, Suite 100…" />
+        </div>
+        <div class="field">
+          <label class="field-label">City</label>
+          <input type="text" id="intended-city" placeholder="New York" />
+        </div>
+      </div>
+
+      <div class="two-col">
+        <div class="field">
+          <label class="field-label">State</label>
+          <input type="text" id="intended-state" placeholder="NY" maxlength="2" style="text-transform:uppercase;" />
+        </div>
+        <div class="field">
+          <label class="field-label">ZIP code</label>
+          <input type="text" id="intended-zip" placeholder="10001" maxlength="10" />
+        </div>
       </div>
 
       <div class="field">
@@ -765,6 +787,7 @@
     document.getElementById('upload-progress').style.display = 'block';
 
     try {
+      // Step 1: Upload photos
       const photoUrls = [];
       const folder = street.replace(/[^a-z0-9]/gi, '_').toLowerCase().slice(0, 40);
       for (let i = 0; i < contribFiles.length; i++) {
@@ -773,23 +796,83 @@
         const url = await uploadPhoto(contribFiles[i], folder);
         photoUrls.push(url);
       }
+
+      // Step 2: Save to database immediately
       document.getElementById('upload-status').textContent = 'Saving to database…';
       document.getElementById('progress-fill').style.width = '92%';
 
-      const { error } = await sb.from('mailrooms').insert([{ address, street, city, state, zip, unit, name, description, photo_urls: photoUrls }]);
+      const { data: insertData, error } = await sb
+        .from('mailrooms')
+        .insert([{ address, street, city, state, zip, unit, name, description, photo_urls: photoUrls }])
+        .select('id')
+        .single();
       if (error) throw error;
 
       document.getElementById('progress-fill').style.width = '100%';
+
+      // Step 3: Show success immediately
       setTimeout(() => {
         document.getElementById('contrib-form').style.display = 'none';
         document.getElementById('contrib-success').style.display = 'block';
       }, 350);
+
+      // Step 4: Tag in the background — fire and forget
+      tagMailroomInBackground(insertData.id, photoUrls[0], description, address);
+
     } catch (err) {
       errBox.textContent = 'Upload failed: ' + (err.message || 'Unknown error. Check your Supabase storage bucket policies.');
       errBox.style.display = 'block';
       btn.innerHTML = '<span>Submit to private repository</span>';
       btn.disabled = false;
       document.getElementById('upload-progress').style.display = 'none';
+    }
+  }
+
+  async function tagMailroomInBackground(id, photoUrl, description, address) {
+    try {
+      const tagPrompt = `You are analyzing a photo of a building mailroom or package delivery area to generate descriptive tags for a visual matching database.
+
+Building address: ${address}
+${description ? 'User description: ' + description : ''}
+
+Look carefully at the photo and generate 8-15 short descriptive tags. Cover:
+- Wall color and material (e.g. "white painted walls", "grey concrete", "yellow walls", "brick walls")
+- Floor type (e.g. "grey tile", "concrete floor", "wood floor", "blue carpet")
+- Locker/mailbox type (e.g. "silver metal lockers", "brass mailboxes", "Amazon Hub locker", "package lockers", "parcel pending lockers", "no lockers visible")
+- Layout (e.g. "rows of mailboxes", "open shelf area", "package room", "lobby mailroom", "basement location")
+- Lighting (e.g. "fluorescent lighting", "natural light", "dim lighting", "bright overhead lights")
+- Notable features (e.g. "security camera visible", "building directory", "intercom panel", "fire extinguisher", "bulletin board", "elevator nearby")
+- Any visible branding or signage (e.g. "USPS label", "UPS drop box", "FedEx signage", "building name visible")
+- Approximate size (e.g. "small mailroom", "large package room", "narrow hallway setup")
+
+Return ONLY a JSON array of strings, no preamble, no markdown:
+["tag one", "tag two", "tag three"]`;
+
+      const response = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 400,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'url', url: photoUrl } },
+              { type: 'text', text: tagPrompt }
+            ]
+          }]
+        })
+      });
+
+      const data = await response.json();
+      const raw = data.content.map(b => b.text || '').join('');
+      const tags = JSON.parse(raw.replace(/```json|```/g, '').trim());
+
+      // Update the row in Supabase with the generated tags
+      await sb.from('mailrooms').update({ tags }).eq('id', id);
+    } catch (e) {
+      // Silent fail — tags are a bonus, not critical
+      console.warn('Background tagging failed:', e.message);
     }
   }
 
@@ -809,10 +892,18 @@
   }
 
   async function analyzePackage() {
-    const address = document.getElementById('intended-address').value.trim();
+    const street = document.getElementById('intended-street').value.trim();
+    const unit = document.getElementById('intended-unit').value.trim();
+    const city = document.getElementById('intended-city').value.trim();
+    const state = document.getElementById('intended-state').value.trim().toUpperCase();
+    const zip = document.getElementById('intended-zip').value.trim();
     const context = document.getElementById('extra-context').value.trim();
     if (!trackBase64) { alert('Please upload a delivery photo first.'); return; }
-    if (!address) { alert('Please enter the intended delivery address.'); return; }
+    if (!street) { alert('Please enter the street address.'); return; }
+    if (!city) { alert('Please enter the city.'); return; }
+    if (!state) { alert('Please enter the state.'); return; }
+    if (!zip) { alert('Please enter the ZIP code.'); return; }
+    const address = [street, unit, city, state + ' ' + zip].filter(Boolean).join(', ');
 
     const btn = document.getElementById('analyze-btn');
     btn.disabled = true;
@@ -856,7 +947,7 @@
         repoImages.push({ entry, photoUrl, index: idx });
         messageContent.push({
           type: 'text',
-          text: `\n[REPO ${idx}] Address: ${entry.address}${entry.unit ? ', ' + entry.unit : ''} | Building: ${entry.name || 'N/A'} | Description: ${entry.description || 'N/A'}`
+          text: `\n[REPO ${idx}] Address: ${entry.address}${entry.unit ? ', ' + entry.unit : ''} | Building: ${entry.name || 'N/A'} | Description: ${entry.description || 'N/A'} | Tags: ${(entry.tags || []).join(', ') || 'none yet'}`
         });
         messageContent.push({ type: 'image', source: { type: 'url', url: photoUrl } });
       }
@@ -876,7 +967,8 @@ You have been shown:
 Your task:
 - Carefully compare the FIRST photo (the delivery location) against each REPO photo visually
 - Look for matching details: wall color, flooring, locker brand/color/layout, signage, lighting fixtures, ceiling type, architectural features, paint color, number of mailboxes, any visible text or logos
-- Rate each repo entry's visual similarity to the delivery photo as a percentage
+- Use the Tags for each repo entry as additional matching signals alongside the visual comparison
+- Rate each repo entry's visual similarity to the delivery photo as a percentage, combining visual evidence and tag matches
 - Also reason about geographic proximity to the intended address
 - Provide clear next steps for the recipient
 
